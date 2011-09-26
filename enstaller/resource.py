@@ -23,6 +23,10 @@ from indexed_repo.requirement import add_Reqs_to_spec
 
 logger = logging.getLogger(__name__)
 
+class EnstallerResourceIndexError(EnvironmentError):
+    """ Raise when one or more Enstaller resource indices cannot be read.
+    """
+    pass
 
 class Resources(object):
 
@@ -37,6 +41,7 @@ class Resources(object):
         self.product_index_path = 'products'
         self.authenticate = True
 
+        #FIXME: apparently param urls is no longer used. Should it be removed?
         for url in urls:
             self.add_product(url)
 
@@ -77,14 +82,21 @@ class Resources(object):
             logger.exception('Error getting products file %s' % index_url)
             return
 
+        failed_index_urls = []
         for product in index:
             product_url = '%s/products/%s' % (url, product['product'])
+            product['base_url'] = url
+            product['url'] = product_url.rstrip('/')
             try:
-                product['base_url'] = url
-                product['url'] = product_url.rstrip('/')
                 self.add_product(product)
-            except HTTPError:
-                logger.exception('Error getting index file %s' % product_url)
+            except EnstallerResourceIndexError as bad_url:
+                failed_index_urls.append(str(bad_url))
+                    
+        if failed_index_urls:
+            raise EnstallerResourceIndexError(
+                'Unable to read resource indices:\n' + 
+                '\n'.join(failed_index_urls)
+            )
 
     def _read_product_index(self, product_url):
         """ Get the product index.
@@ -92,7 +104,11 @@ class Resources(object):
         Try the platform-independent one first, then try the
         platform-specific one if that one doesn't exist. Does both
         HTTP requests simultaneously.
-
+        
+        Returns a 2-tuple:
+            (first successful URL parsed, corresponding index)
+            
+        Raises EnstallerResourceIndexError if both lookups fail.
         """
         independent = urlsplit('%s/index.json' % (product_url))
         specific = urlsplit('%s/index-%s.json' % (product_url, self.plat))
@@ -110,47 +126,51 @@ class Resources(object):
 
         try:
             res = conn1.getresponse()
-            if res.status == 200:
+            if res.status == 200: # OK
                 data = res.read()
                 return independent, json.loads(data)
             res = conn2.getresponse()
-            if res.status == 200:
+            if res.status == 200: # OK
                 data = res.read()
                 return specific, json.loads(data)
             else:
-                raise HTTPError(specific, res.code, res.reason, res.msg)
+                logger.error('Error reading index for {}\n'
+                             'status={}\n'
+                             'reason={}\n'
+                             'msg={}\n'
+                             'read()={}'.format(specific, res.status, res.reason,
+                                                res.msg, res.read()))
+                raise EnstallerResourceIndexError(specific.path)
+                    
+            
         except ValueError:
             logger.exception('Error parsing index for %s' % product_url)
             logger.error('Invalid index file: """%s"""' % data)
-            return None, None
-        except HTTPError:
-            logger.exception('Error reading index for %s' % product_url)
-            return None, None
+            raise EnstallerResourceIndexError(specific.path)
         finally:
             conn1.close()
             conn2.close()
 
-    def add_product(self, index):
-
+    def add_product(self, product):
+        """ Add a product (specified by a dictionary parameter) to this 
+        resource object. 
+        """
         if self.verbose:
-            print "Adding product:", index['url']
+            print "Adding product:", product['url']
 
-        index_url, product_index = self._read_product_index(index['url'])
-        if product_index is None:
-            return
+        index_url, product_index = self._read_product_index(product['url'])
 
-        index['index_url'] = index_url
-        index.update(product_index)
+        product['index_url'] = index_url
+        product.update(product_index)
 
-        if 'platform' in index and index['platform'] != self.plat:
+        if 'platform' in product and product['platform'] != self.plat:
             raise Exception('index file for platform %s, but running %s' %
-                            (index['platform'], self.plat))
+                            (product['platform'], self.plat))
 
-        if 'eggs' in index:
-            self._add_egg_repos(index['url'], index)
+        if 'eggs' in product:
+            self._add_egg_repos(product['url'], product)
 
-        self.index.append(index)
-        return index
+        self.index.append(product)
 
     def _add_egg_repos(self, url, index):
         if 'egg_repos' in index:
